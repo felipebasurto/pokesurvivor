@@ -17,6 +17,17 @@ G.ModUI = (() => {
 
   function init() {
     $('mod-back').onclick = () => G.RankingUI.open();
+    $('mod-purge').onclick = async () => {
+      if (!confirm('¿Quitar del ranking TODAS las marcas de más de 35 minutos (todas las tablas)? No se puede deshacer.')) return;
+      const b = $('mod-purge');
+      b.disabled = true;
+      try {
+        const r = await G.Ranking.purgeAbove(35 * 60, (i, n) => { b.textContent = 'Revisando ' + i + ' / ' + n + '…'; });
+        G.UI.toast('Quitadas ' + r.rows + ' marcas de más de 35 min (' + r.boards + ' tablas)', 5000);
+      } catch (e) { G.UI.toast('No se pudo: ' + (e.code || e.message), 5000); }
+      b.disabled = false; b.textContent = 'Quitar marcas de más de 35 min';
+      render();
+    };
     document.querySelectorAll('#mod-tabs .tab').forEach(t => { t.onclick = () => { tab = t.dataset.tab; render(); }; });
   }
 
@@ -41,15 +52,37 @@ G.ModUI = (() => {
     }
   }
 
+  /** "s_w2026-42" -> "Solo · Semana" */
+  function boardName(b) {
+    const [m, p] = b.split('_');
+    const mode = m === 'g' ? 'Grupo' : 'Solo';
+    const per = p.startsWith('d') ? 'Hoy' : p.startsWith('w') ? 'Semana' : p.startsWith('m') ? 'Mes' : 'Histórico';
+    const dex = (b.match(/_p(\d+)$/) || [])[1];
+    return mode + ' · ' + per + (dex && G.DEX_BY[dex] ? ' · sólo ' + G.DEX_BY[dex].name : '');
+  }
+  // Con la Sentencia de Arceus (minuto 30) casi nadie pasa de ~32-33 min.
+  const SUSPECT_T = 33 * 60;
+
   async function renderReports(list) {
     const groups = await G.Ranking.reports();
     list.innerHTML = groups.length ? '' : '<p class="sub">No hay reportes.</p>';
     for (const g of groups) {
       const row = document.createElement('div');
-      row.className = 'rk-row mod-row';
+      row.className = 'rk-row mod-row rep';
       const mode = g.board.startsWith('g_') ? 'g' : 's';
-      row.innerHTML = `<span class="pos" title="reportes">${g.n}×</span>
-        <span class="who"><b translate="no">${g.names.map(esc).join(' · ')}</b><small translate="no">${esc(g.board)} · ${fmt(g.t)}</small></span>`;
+      // Lo que se ve de la marca ahora en su tabla (nivel, derrotados, Pokémon).
+      const info = await G.Ranking.entryInfo(g.board, g.e).catch(() => null);
+      const t = info ? info.t : g.t;
+      const sus = t > SUSPECT_T;
+      const mons = document.createElement('span');
+      mons.className = 'mons';
+      if (info) info.dex.forEach((d, i) => { if (G.DEX_BY[d]) mons.appendChild(G.UI.spriteCanvas(d, 44, 40, { scale: 1, shiny: !!(info.shiny || [])[i] })); });
+      row.innerHTML = `<span class="pos" title="veces reportada">${g.n}×</span>`;
+      row.appendChild(mons);
+      row.insertAdjacentHTML('beforeend', `<span class="who"><b translate="no">${g.names.map(esc).join(' · ')}</b>
+          <small>${esc(boardName(g.board))}${info ? ' · Nv. ' + (info.lv || 1) + ' · ' + (info.kills || 0).toLocaleString('es') + ' derrotados' : ' · ya no está en el top 50'}</small>
+          ${sus ? '<small class="mod-warn">Más de 33 min: casi imposible con la Sentencia de Arceus</small>' : ''}</span>
+        <span class="time${sus ? ' mod-warn' : ''}">${fmt(t)}</span>`);
       const acts = document.createElement('span');
       acts.className = 'mod-acts';
       const busy = async (fn, msg) => {

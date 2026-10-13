@@ -42,6 +42,8 @@ G.Ranking = (() => {
   // Las runs de menos de 1 minuto no se suben (casi nunca entran en una tabla
   // y eran muchas lecturas y escrituras para nada).
   const MIN_T = 60;
+  // Y las que duran más de lo posible tampoco (el servidor las rechazaría igual).
+  const MAX_T = G.Integrity.MAX_T;
   const TTL = 30 * 60 * 1000;            // caché de lo leído (30 min: menos lecturas de Firestore)
 
   const fbx = () => G.DB.online ? G.DB.fb : null;
@@ -117,6 +119,28 @@ G.Ranking = (() => {
     try { localStorage.setItem(bestKey(), JSON.stringify(b)); } catch (e) { /* lleno */ }
   }
 
+  // ---------------- umbral de cada tabla ----------------
+  /*
+   * La marca más baja del top 50 de cada tabla, cuando está llena. Sólo puede
+   * subir con el tiempo, así que un valor viejo sigue sirviendo: si tu marca
+   * no lo supera, seguro que no entra y no hace falta leer nada (cada resumen
+   * pesa ~30 KB y al acabar una partida se miraban hasta 5; 13-10-2026).
+   */
+  const THR = 'ps.rk.thr';
+  function thresholds() { try { return JSON.parse(localStorage.getItem(THR) || '{}'); } catch (e) { return {}; } }
+  function noteTop(b, top) {
+    const vals = Object.values(top || {});
+    if (vals.length < TOP) return;
+    const low = Math.min(...vals.map(v => v.t));
+    const t = thresholds();
+    if ((t[b] || 0) >= low) return;
+    t[b] = low;
+    // Sólo las tablas de los periodos de ahora (y las históricas).
+    const cur = Object.values(periodIds());
+    for (const k of Object.keys(t)) if (!cur.some(p => k.split('_')[1] === p)) delete t[k];
+    try { localStorage.setItem(THR, JSON.stringify(t)); } catch (e) { /* lleno */ }
+  }
+
   // ---------------- guardar ----------------
 
   const rowOf = (id, v) => ({ id, t: v.t, uids: v.uids || [], names: v.names || [], dex: v.dex || [], shiny: v.shiny || [], lv: v.lv, kills: v.kills });
@@ -137,40 +161,127 @@ G.Ranking = (() => {
     if (!fb) return;
     const go = n => fb.fs.collection('runs').doc(fb.uid).set({ startedAt: now(), mode })
       .catch(e => { console.warn('[Ranking] inicio:', e.code || e.message); if (n < 2) setTimeout(() => go(n + 1), 15000); });
+    busy = busy.then(() => flushNow()).catch(() => {});      // las marcas pendientes de antes se suben ANTES de cambiar la hora de inicio
     busy.then(() => go(0));
   }
   /** La subida de una marca (para que la partida siguiente espere a que acabe). */
   function track(p) { busy = p.catch(() => {}); return p; }
 
-  /** Guarda la entrada en cada tabla donde mejore. → periodos mejorados */
-  async function store(boards, id, entry) {
+  /**
+   * Sube la grabación de la partida (replays/{uid}). Las reglas piden que la
+   * marca que la cita (sm.rid) ya la tenga detrás, así que va SIEMPRE antes de
+   * la marca. Si falla se reintenta con espera creciente (BACKOFF); si sigue
+   * fallando la marca no se pierde: pasa a la cola (ver más abajo).
+   */
+  const BACKOFF = [0, 1500, 4000];
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  async function saveReplay(rep) {
+    const fb = fbx();
+    if (!fb || !rep) return false;
+    for (const ms of BACKOFF) {
+      if (ms) await wait(ms);
+      try {
+        await fb.fs.collection('replays').doc(fb.uid).set({
+          rid: rep.rid, v: String(rep.hdr.v || '').slice(0, 16), t: rep.t, mode: rep.hdr.mode, h: JSON.stringify(rep.hdr),
+          log: rep.log, n: rep.n, trunc: !!rep.trunc, at: now()
+        });
+        return true;
+      } catch (e) {
+        console.warn('[Ranking] grabación:', e.code || e.message);
+        if (e.code === 'permission-denied') return false;          // las reglas no la aceptan: reintentar no sirve
+      }
+    }
+    return false;
+  }
+
+  // ---------------- cola de marcas pendientes ----------------
+  /*
+   * Si no se pudo subir la grabación (sin red, servidor caído...) la marca NO se
+   * sube sin ella (las reglas la rechazarían) ni se pierde: se guarda aquí con su
+   * grabación y se reintenta en la próxima sesión (al entrar y antes de empezar
+   * otra partida, para que runs/{uid} aún tenga la hora de ésa). Hasta 3 veces;
+   * la última, en formato antiguo (sin resumen), que las reglas aceptan mientras
+   * no pase la fecha de SM_OBLIGATORIO (tools/make_rules.js). Como mucho 2
+   * marcas en cola y 3 días.
+   */
+  const QKEY = () => 'ps.rk.q.' + (fbx() ? fbx().uid : '');
+  const QMAX = 2, QDAYS = 3, QTRIES = 3;
+  function queueGet() { try { return JSON.parse(localStorage.getItem(QKEY()) || '[]'); } catch (e) { return []; } }
+  function queueSet(q) {
+    try { if (q.length) localStorage.setItem(QKEY(), JSON.stringify(q)); else localStorage.removeItem(QKEY()); }
+    catch (e) { /* lleno: se pierde la cola, no la partida */ }
+  }
+  function enqueue(item) {
+    const q = queueGet().filter(x => x.id !== item.id || x.entry.t !== item.entry.t);
+    q.push(Object.assign({ at: Date.now(), n: 0 }, item));
+    queueSet(q.slice(-QMAX));
+  }
+  let flushing = null;
+  /** Reintenta las marcas pendientes (de a una). */
+  function flushNow() {
+    const fb = fbx();
+    if (!fb || flushing) return flushing || Promise.resolve([]);
+    flushing = (async () => {
+      const done = [];
+      for (const item of queueGet()) {
+        const cur = Object.values(periodIds());
+        const boards = item.boards.filter(([b]) => cur.some(p => b.split('_')[1] === p));
+        const old = Date.now() - item.at > QDAYS * 86400000;
+        let failed = false;
+        if (boards.length && !old) {
+          item.n++;
+          const r = await store(boards, item.id, item.entry, item.rep, item.n >= QTRIES);
+          failed = r.failed && item.n < QTRIES;
+          if (r.better.length) done.push(...r.better);
+        }
+        const q = queueGet().filter(x => !(x.id === item.id && x.entry.t === item.entry.t));
+        if (failed) q.push(item);
+        queueSet(q);
+      }
+      if (done.length) announce([...new Set(done)]);
+      return done;
+    })().finally(() => { flushing = null; });
+    return flushing;
+  }
+  const flushQueue = () => track(flushNow());
+
+  /**
+   * Guarda la entrada en cada tabla donde mejore. → { better: periodos mejorados,
+   * failed: no se pudo subir la grabación y quedó sin guardar }
+   * @param legacy  sin resumen ni grabación (último intento de la cola)
+   */
+  async function store(boards, id, entry, rep, legacy = false) {
     const fb = fbx();
     const better = [];
+    let failed = false;
     const known = bests();
+    // La grabación sólo se sube si alguna tabla va a escribirse (una vez por partida).
+    let replayP = null;
+    const withReplay = () => replayP || (replayP = saveReplay(rep));
     await Promise.all(boards.map(async ([b, period]) => {
       const key = b + ':' + id;
       try {
-        // ¿Ya tenías una marca mejor? Si este navegador no lo sabe, se mira una vez.
-        if (known[key] === undefined) {
-          if (TOP_ONLY.has(period)) {
-            // En estas tablas sólo hay marcas en el top 50: basta con el resumen
-            // (que además se guarda 30 min y es el mismo que se lee al mirar el ranking).
-            const top = await summary(b);
-            known[key] = top[id] ? top[id].t : 0;
-          } else {
-            const old = await col(b).doc(id).get();
-            known[key] = old.exists ? old.data().t : 0;
-          }
+        const topOnly = TOP_ONLY.has(period);
+        // Si no llegas a la 50.ª marca que conoce este navegador, no entras: en
+        // diario, semanal, mensual y por Pokémon no hay nada que hacer (ni leer).
+        const thr = thresholds()[b] || 0;
+        if (topOnly && thr && entry.t <= thr) return;
+        // ¿Ya tenías una marca mejor? En el histórico, si este navegador no lo
+        // sabe, se mira una vez tu marca (pequeña). En las demás lo dice el
+        // resumen, que se lee igualmente dentro de la transacción de abajo.
+        if (known[key] === undefined && !topOnly) {
+          const old = await col(b).doc(id).get();
+          known[key] = old.exists ? old.data().t : 0;
         }
-        if (known[key] >= entry.t) return;
+        if ((known[key] || 0) >= entry.t) return;
+        let sm = legacy ? null : entry.sm;
+        if (sm && !(await withReplay())) { failed = true; return; }
         const data = Object.assign({}, entry, { at: firebase.firestore.FieldValue.serverTimestamp() });
+        if (sm) data.sm = sm; else delete data.sm;
         // Si la tabla ya está llena y no llegas al top 50, no hace falta tocar el resumen
         // (y en diario, semanal y mensual, ni siquiera se guarda la marca).
-        const topOnly = TOP_ONLY.has(period);
         const cached = cacheGet('s:' + b);
-        const full = cached && Object.keys(cached).length >= TOP;
-        const minT = full ? Math.min(...Object.values(cached).map(v => v.t)) : 0;
-        if (full && entry.t <= minT && !(id in cached)) {
+        if (thr && entry.t <= thr && !(cached && id in cached)) {
           if (!topOnly) await col(b).doc(id).set(data);
           else { known[key] = entry.t; return; }
         } else {
@@ -179,7 +290,9 @@ G.Ranking = (() => {
           await fb.fs.runTransaction(async tx => {
             const s = await tx.get(sumRef(b));
             const top = Object.assign({}, s.exists ? s.data().top : {});
-            const mine = { t: entry.t, uids: entry.uids, names: entry.names, dex: entry.dex, shiny: entry.shiny, lv: entry.lv, kills: entry.kills };
+            // (Sin "shiny" si no hay ninguno: el resumen pesa menos.)
+            const mine = { t: entry.t, uids: entry.uids, names: entry.names, dex: entry.dex, lv: entry.lv, kills: entry.kills };
+            if (entry.shiny.some(Boolean)) mine.shiny = entry.shiny;
             let ev = '';
             // Ya estabas con una marca mejor (otro ordenador): nada que escribir.
             if (id in top && top[id].t >= entry.t) { entered = false; newTop = top; return; }
@@ -196,7 +309,7 @@ G.Ranking = (() => {
             tx.set(sumRef(b), { top, me: id, ev });
             newTop = top;
           });
-          if (newTop) cacheSet('s:' + b, newTop);
+          if (newTop) { cacheSet('s:' + b, newTop); noteTop(b, newTop); }
           if (topOnly && !entered) { known[key] = entry.t; return; }
         }
         known[key] = entry.t;
@@ -206,7 +319,7 @@ G.Ranking = (() => {
       } catch (e) { console.warn('[Ranking] no se pudo guardar en', b, e.code || e.message); }
     }));
     saveBests(known);
-    return better;
+    return { better, failed };
   }
 
   function announce(better) {
@@ -219,31 +332,33 @@ G.Ranking = (() => {
   function submitSolo(r) { return track(submitSoloNow(r)); }
   async function submitSoloNow(r) {
     const fb = fbx();
-    if (!fb || !G.Social.me || r.t < MIN_T) return [];
+    if (!fb || !G.Social.me || r.t < MIN_T || r.t > MAX_T || !G.Integrity.rankable()) return [];
     const ids = periodIds();
-    const entry = { t: r.t, uids: [fb.uid], names: [G.Social.me.name], dex: [r.dex], shiny: [!!r.shiny], lv: r.lv, kills: r.kills };
+    const entry = { t: r.t, uids: [fb.uid], names: [G.Social.me.name], dex: [r.dex], shiny: [!!r.shiny], lv: r.lv, kills: r.kills, sm: r.sm };
     const boards = PERIODS.map(([p]) => ['s_' + ids[p], p]);
     boards.push(['s_' + ALL + '_p' + r.dex, 'p']);
-    const better = await store(boards, fb.uid, entry);
-    announce(better);
-    return better;
+    const res = await store(boards, fb.uid, entry, r.rep);
+    if (res.failed) enqueue({ boards, id: fb.uid, entry, rep: r.rep });
+    announce(res.better);
+    return res.better;
   }
 
   /** La sube el anfitrión, con todo el equipo. */
   function submitGroup(r) { return track(submitGroupNow(r)); }
   async function submitGroupNow(r) {
     const fb = fbx();
-    if (!fb || r.t < MIN_T || !r.members || r.members.length < 2) return [];
+    if (!fb || r.t < MIN_T || r.t > MAX_T || !G.Integrity.rankable() || !r.members || r.members.length < 2) return [];
     const ms = r.members.slice().sort((a, b) => (a.uid < b.uid ? -1 : 1));
     const id = ms.map(m => m.uid).join('_');
     const entry = { t: r.t, uids: ms.map(m => m.uid), names: ms.map(m => m.name), dex: ms.map(m => m.dex),
-                    shiny: ms.map(m => !!m.shiny), lv: r.lv, kills: r.kills };
+                    shiny: ms.map(m => !!m.shiny), lv: r.lv, kills: r.kills, sm: r.sm };
     const ids = periodIds();
     const boards = PERIODS.map(([p]) => ['g_' + ids[p], p]);
     for (const d of new Set(entry.dex)) boards.push(['g_' + ALL + '_p' + d, 'p']);
-    const better = await store(boards, id, entry);
-    announce(better);
-    return better;
+    const res = await store(boards, id, entry, r.rep);
+    if (res.failed) enqueue({ boards, id, entry, rep: r.rep });
+    announce(res.better);
+    return res.better;
   }
 
   // ---------------- leer ----------------
@@ -257,6 +372,7 @@ G.Ranking = (() => {
       inflight.set(b, sumRef(b).get().then(s => {
         const top = s.exists ? (s.data().top || {}) : {};
         cacheSet('s:' + b, top);
+        noteTop(b, top);
         return top;
       }).finally(() => inflight.delete(b)));
     }
@@ -398,7 +514,7 @@ G.Ranking = (() => {
   }
 
   // Cuenta de moderación (firestore.rules, admin()): la pantalla oculta de js/ui/mod-ui.js.
-  const ADMINS = ['PENDIENTE_UID_ADMIN'];
+  const ADMINS = ['rshaa5gKD3fXw6lE4PPXITbowaG2'];
   const isAdmin = () => !!fbx() && ADMINS.includes(fbx().uid);
 
   /** Admin: los reportes, juntos por marca (los más reportados primero). */
@@ -411,6 +527,12 @@ G.Ranking = (() => {
       const g = by.get(k); g.n++; g.ids.push(d.id);
     }
     return [...by.values()].sort((a, b) => b.n - a.n || b.at - a.at);
+  }
+
+  /** Admin: la fila de una marca en el top 50 de su tabla (o null si ya no está). */
+  async function entryInfo(b, e) {
+    const top = await summary(b);
+    return top[e] ? rowOf(e, top[e]) : null;
   }
 
   /** Admin: quita una marca de una tabla (la marca y su fila del top 50). */
@@ -436,6 +558,42 @@ G.Ranking = (() => {
     await Promise.all([...boards].map(b => removeEntry(b, e)));
   }
 
+  /**
+   * Admin: quita de TODAS las tablas las marcas de más de `maxT` segundos (las
+   * filas de cada top 50 y las marcas sueltas del histórico). Con la Sentencia
+   * de Arceus nadie legal pasa de ~32 min. → { rows, boards }
+   */
+  async function purgeAbove(maxT, onProgress) {
+    const fs = fbx().fs;
+    const all = await fs.collection('lbs').get();
+    let rows = 0, boards = 0, n = 0;
+    for (const d of all.docs) {
+      n++;
+      if (onProgress && n % 50 === 0) onProgress(n, all.size);
+      const top = d.data().top || {};
+      const bad = Object.keys(top).filter(id => (top[id].t || 0) > maxT);
+      if (!bad.length) continue;
+      await fs.runTransaction(async tx => {
+        const s = await tx.get(d.ref);
+        const cur = Object.assign({}, (s.exists && s.data().top) || {});
+        const gone = Object.keys(cur).filter(id => (cur[id].t || 0) > maxT);
+        if (!gone.length) return;
+        for (const id of gone) delete cur[id];
+        tx.set(d.ref, { top: cur, me: '', ev: gone[0] });
+      });
+      await Promise.all(bad.map(id => fs.collection('lb').doc(d.id).collection('e').doc(id).delete().catch(() => {})));
+      rows += bad.length; boards++;
+      mem.delete('s:' + d.id); try { localStorage.removeItem('ps.rk.c.s:' + d.id); } catch (e) { /* nada */ }
+    }
+    // Las marcas del histórico que no están en el top 50 (sirven para el puesto exacto).
+    for (const b of ['s_' + ALL, 'g_' + ALL]) {
+      const q = await col(b).where('t', '>', maxT).get();
+      await Promise.all(q.docs.map(e => e.ref.delete().catch(() => {})));
+      rows += q.size;
+    }
+    return { rows, boards };
+  }
+
   /** Admin: marca o desmarca una cuenta (marcada = no puede subir marcas). */
   function setMarked(uid, on) { return fbx().fs.collection('saves').doc(uid).update({ sus: !!on }); }
   /** Admin: borra reportes ya vistos. */
@@ -447,6 +605,6 @@ G.Ranking = (() => {
       t1: (v.tickets || {}).t1 || 0, t10: (v.tickets || {}).t10 || 0, owned: Object.keys(v.owned || {}).length }; });
   }
 
-  return { PERIODS, periodIds, board, runStarted, submitSolo, submitGroup, top, myRank, removeMine,
-           report, reported, isAdmin, reports, removeEntry, removeEverywhere, setMarked, dismiss, markedAccounts };
+  return { PERIODS, periodIds, board, runStarted, flushQueue, submitSolo, submitGroup, top, myRank, removeMine,
+           report, reported, isAdmin, reports, entryInfo, removeEntry, purgeAbove, removeEverywhere, setMarked, dismiss, markedAccounts };
 })();
